@@ -65,8 +65,8 @@ public class StructuredUploader {
 	private static Credential authorize() throws Exception {
 		// load client secrets
 		GoogleClientSecrets clientSecrets = GoogleClientSecrets.load(
-				JSON_FACTORY,
-				StructuredUploader.class.getResourceAsStream("client_secrets.json"));
+				JSON_FACTORY, new FileInputStream("client_secrets.json"));
+				//StructuredUploader.class.getResourceAsStream("client_secrets.json"));
 		if (clientSecrets.getDetails().getClientId().startsWith("Enter")
 				|| clientSecrets.getDetails().getClientSecret()
 						.startsWith("Enter ")) {
@@ -107,9 +107,9 @@ public class StructuredUploader {
 		
 		// hardcode here to avoid awkward eclipse cmdln args
 		// remove for deploy
-		fileName = "collection_All_ANIT_Raw_Merged_10658.txt";
+		fileName = "collection_All_ANIT_Raw_Merged_10658_transposed.txt";
 		rootName = "ANIT_Sample_Data_Full";
-		transpose = true;
+		transpose = false;
 		
 		
 		if (transpose) { // looks for .txt extension
