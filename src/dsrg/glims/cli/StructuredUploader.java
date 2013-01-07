@@ -2,6 +2,7 @@ package dsrg.glims.cli;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.FileReader;
@@ -14,6 +15,7 @@ import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Random;
 
 import com.google.api.client.auth.oauth2.Credential;
 import com.google.api.client.extensions.java6.auth.oauth2.AuthorizationCodeInstalledApp;
@@ -60,6 +62,8 @@ public class StructuredUploader {
 	private static Drive drive;
 	
 	private final static String FOLDER_MIME_TYPE = "application/vnd.google-apps.folder";
+	
+	private static final int MIN_BATCH_SIZE = 20;
 
 	/** Authorizes the installed application to access user's protected data. */
 	private static Credential authorize() throws Exception {
@@ -199,7 +203,6 @@ public class StructuredUploader {
 								next);
 
 					} catch (IOException e) {
-						// TODO Auto-generated catch block
 						e.printStackTrace();
 
 					} finally {
@@ -221,7 +224,6 @@ public class StructuredUploader {
 			File file = drive.files().get(parentFolder).execute();
 			drive.permissions().insert(file.getId(), perm).execute();
 		} catch (IOException e) {
-			// TODO Auto-generated catch block
 			e.printStackTrace();
 		}
 		if (!lowest)
@@ -246,7 +248,6 @@ public class StructuredUploader {
 				}
 			}
 		} catch (IOException e) {
-			// TODO Auto-generated catch block
 			e.printStackTrace();
 			// System.out.println("children: "+children.toPrettyString());
 			// System.out.println("child: "+child.toPrettyString());
@@ -302,6 +303,303 @@ public class StructuredUploader {
 		uploader.setProgressListener(new FileUploadProgressListener());
 		return insert.execute();
 	}
+	
+	/**
+	 * Still has batch stuff but am in the process of rewriting not to have any batched 
+	 * file processing on google drive
+	 * @param fileName
+	 * @param rootName
+	 * @param service
+	 * @throws FileNotFoundException
+	 * @throws LockException
+	 * @throws IOException
+	 */
+	private static void writeDocsLabelsFromBlobStandardFormatNoBatch(String fileName, String rootName, Drive service)
+			throws FileNotFoundException, LockException, IOException {
+		
+		String optionalRootCollectionId = "";
+		BufferedReader reader = new BufferedReader(new FileReader(fileName));
+		
+		System.out.println("reading file: " + fileName);
+		
+		String metadataline = reader.readLine();
+
+		String[] metadataArray = metadataline.split("\t");
+		for (int i = 0; i < metadataArray.length; i++)
+			metadataArray[i] = metadataArray[i].trim();
+		
+		System.out.println("metadata: ");
+		System.out.println(Arrays.toString(metadataArray));
+		
+		File rootFolder = null;
+		try {
+			rootFolder = service.files().get(optionalRootCollectionId).execute();
+		} catch (Exception e) {	}
+		
+		BatchRequest batch = service.batch();
+		StructuredUploader uploader = new StructuredUploader();
+		FileCallback rootFolderCallback = uploader.new FileCallback();
+		if (rootFolder == null) {
+			// Create root folder
+			System.out.println("Creating root folder ...");
+			Insert rootFolderInsert = service.files().insert(new File().setTitle(rootName).setMimeType(FOLDER_MIME_TYPE));
+			rootFolderInsert.queue(batch, rootFolderCallback);
+		}
+		
+		// Keep track of all metadata key folders that already exist and their metadata value subfolders
+		HashMap<String,String> id2Title = new HashMap<String,String>();
+		HashMap<String,File> metadataKeyFolders = new HashMap<String,File>();
+		HashMap<String,FileListCallback> metadataChildrenCallbacks = new HashMap<String,FileListCallback>();
+		if (rootFolder != null) { // Get metadata key folders
+			List<File> metadataKeyFileList = service.files().list().setQ("'"+rootFolder.getId()+"' in parents").execute().getItems();
+			for (File file : metadataKeyFileList) {
+				metadataKeyFolders.put(file.getTitle(),file);
+				id2Title.put(file.getId(), file.getTitle());
+				com.google.api.services.drive.Drive.Files.List metadataChildrenFileList = service.files().list().setQ("'"+file.getId()+"' in parents");
+				FileListCallback fileListCallback = uploader.new FileListCallback();
+				metadataChildrenFileList.queue(batch, fileListCallback);
+				metadataChildrenCallbacks.put(file.getTitle(), fileListCallback);
+			}
+		}
+		batch.execute(); // Now create all the new folders and get the children subfolders
+		if (rootFolder == null) // Now it's been created
+			rootFolder = rootFolderCallback.getFile();
+		
+		System.out.println("root folder is " + rootFolder.getTitle());
+		System.out.println("folders alrady exist: ");
+		System.out.println(id2Title.values());
+		
+		// Creates the new metadata key folders
+		List<FileCallback> metadataKeyCallbacks = new ArrayList<FileCallback>();				
+		ArrayList<ParentReference> list = new ArrayList<ParentReference>();
+		list.add(new ParentReference().setId(rootFolder.getId()));
+		int dataStart = 0;
+		for (int i = 0; i < metadataArray.length; i++) {
+			if (metadataArray[i].equals("X")) {
+				dataStart = i;
+				break;
+			}
+			if (!metadataKeyFolders.containsKey(metadataArray[i])) {
+				Insert metadataKeyInsert = service.files().insert(new File().setTitle(metadataArray[i]).setMimeType(FOLDER_MIME_TYPE).setParents(list));
+				FileCallback metadataKeyCallback = uploader.new FileCallback();
+				metadataKeyCallbacks.add(metadataKeyCallback);
+				metadataKeyInsert.queue(batch,metadataKeyCallback);
+			}
+			if (batch.size() > 10)
+				batch.execute();
+		}
+		if (batch.size() > 0)
+			batch.execute(); // All metadata key folders have been created
+		
+		HashMap<String,HashMap<String,File>> metadataChildren = new HashMap<String,HashMap<String,File>>();
+		// Now we need to correct the folder hierarchy
+		for (FileCallback callback : metadataKeyCallbacks) {
+			id2Title.put(callback.getFile().getId(), callback.getFile().getTitle());
+			metadataKeyFolders.put(callback.getFile().getTitle(), callback.getFile()); // Add to master list
+			if (!metadataChildren.containsKey(callback.getFile().getTitle()))
+				metadataChildren.put(callback.getFile().getTitle(), new HashMap<String,File>());
+		}
+		
+		System.out.println("all metadata key folders have been created");
+		System.out.println(metadataKeyFolders);
+		
+		System.out.println("updating the metadata values...");
+		// Now create an up to date child list from the new metadata and the old
+		for (String metadataKey : metadataChildrenCallbacks.keySet()) {
+			if (!metadataChildren.containsKey(metadataKey))
+				metadataChildren.put(metadataKey, new HashMap<String,File>());			
+			HashMap<String,File> metadataKeyChildren = metadataChildren.get(metadataKey);
+			for (File file : metadataChildrenCallbacks.get(metadataKey).getFileList().getItems()) {
+				metadataKeyChildren.put(file.getTitle(), file);
+				//System.out.println("adding " + file.getTitle());
+			}
+		}
+		
+		System.out.println("creating metadata values that don't already exist");
+		// Now create the metadata values that don't already exist
+		String line;
+		String[] firstData = null;
+		List<FileCallback> metadataValCallbacks = new ArrayList<FileCallback>();				
+		while ((line = reader.readLine()) != null) {
+			String[] data = line.split("\t");
+			if (firstData == null) {
+				firstData = line.split("\t");
+				for (int i = 0; i < firstData.length; i++)
+					firstData[i] = firstData[i].trim();
+				//System.out.println("first data " + Arrays.toString(firstData));
+			}
+			for (int i = 0; i < dataStart; i++) {
+				data[i] = data[i].trim();
+				if (firstData[i].equals(""))
+					continue;
+				if (data[i].equals(""))
+					data[i] = firstData[i];
+				String metadataKey = metadataArray[i]; 
+				// Only create if new
+				if (!metadataChildren.get(metadataKey).containsKey(data[i])) {						
+					ArrayList<ParentReference> valList = new ArrayList<ParentReference>();
+					valList.add(new ParentReference().setId(metadataKeyFolders.get(metadataKey).getId()));		
+					Insert metadataValInsert = service.files().insert(new File().setTitle(data[i]).setMimeType(FOLDER_MIME_TYPE).setParents(valList));
+					FileCallback metadataValCallback = uploader.new FileCallback();
+					metadataValCallback.setHttpRequest(metadataValInsert);
+					metadataValCallbacks.add(metadataValCallback);
+					metadataValInsert.queue(batch,metadataValCallback);
+					metadataChildren.get(metadataKey).put(data[i], null);
+					//System.out.println("adding " + metadataKey + ": " + data[i]);
+				}
+				if (batch.size() > MIN_BATCH_SIZE) {
+					System.out.println("executing batch...");
+					batch.execute();
+					System.out.println("done");
+					/*try {
+						Thread.sleep(2000);
+					} catch (InterruptedException e) {
+						e.printStackTrace();
+					}*/
+				}
+			}
+		}
+		System.out.println("batch size is " + batch.size());
+		
+		// this doesn't make sense
+		// but i'm saving it in case I make it worse
+//		while (batch.size() > 0) {
+//			batch.execute();
+//			for (FileCallback callback : metadataValCallbacks) {
+//				System.out.println("processing " + callback.getFile()==null?callback.getFile():callback.getFile().getTitle());
+//				if (callback.getFile() != null) {
+//					List<ParentReference> prList = callback.getFile().getParents();
+//					for (ParentReference pr : prList) {
+//						String metadataKey = id2Title.get(pr.getId());
+//						System.out.println(metadataChildren);
+//						//if (!metadataChildren.containsKey(metadataKey))
+//						//	metadataChildren.put(metadataKey, new HashMap<String,File>());
+//						HashMap<String,File> metadataKeyChildren = metadataChildren.get(metadataKey);
+//						System.out.println("callback.getFile " + callback.getFile());
+//						metadataKeyChildren.put(callback.getFile().getTitle(), callback.getFile());
+//					}
+//				} else {
+//					System.out.println("callback.getFile: " + callback + " was null");
+//					callback.getHttpRequest().queue(batch, callback);
+//				}
+//			}
+//			System.out.println("files left " + batch.size());
+//		}
+		
+		// make sure all metadata values have been added
+		Random randomGenerator = new Random();
+		int n = 1;
+		do {
+			if (n<6)
+				n++;
+			try {
+				Thread.sleep((1 << n) * 1000 + randomGenerator.nextInt(1001));
+			} catch (InterruptedException e) {
+				e.printStackTrace();
+			}
+			if (batch.size() > 0) {
+				System.out.println(batch.size() + "files remaining");
+				batch.execute();
+			}			
+			for (FileCallback callback : metadataValCallbacks) {
+				if (callback.getFile() == null) {
+					callback.getHttpRequest().queue(batch, callback);
+				}
+			}
+		} while (batch.size() > 0);
+		
+		// add metadata values folders to our hash
+		int goodCount = 0;
+		int failCount = 0;
+		for (FileCallback callback : metadataValCallbacks) {
+			if (callback.getFile() != null) {
+				System.out.println("processing " + callback.getFile().getTitle());				
+				List<ParentReference> prList = callback.getFile().getParents();
+				for (ParentReference pr : prList) {
+					String metadataKey = id2Title.get(pr.getId());
+					metadataChildren.get(metadataKey).put(callback.getFile().getTitle(), callback.getFile());
+				}
+				goodCount++;
+			} else {
+				//callback.getHttpRequest().queue(batch, callback);
+				System.out.println("problem with callback : " + callback);
+				failCount++;
+			}
+		}
+		
+		System.out.println("goodcount " + goodCount);
+		System.out.println("failcount "+ failCount);
+		
+		// Now to the data
+		reader.close();
+		reader = new BufferedReader(new FileReader(fileName));
+		// Now open the file again and actually upload the data
+		reader.readLine(); // Read header which we don't need
+		while ((line = reader.readLine()) != null) {
+			String [] data = line.split("\t");
+			ArrayList<ParentReference> dataList = new ArrayList<ParentReference>();
+			for (int i = 0; i < dataStart; i++) {
+				if (firstData[i].equals(""))
+					continue;
+				data[i] = data[i].trim();
+				if (data[i].equals(""))
+					data[i] = firstData[i];
+				String metadataKey = metadataArray[i];
+				File parent = metadataChildren.get(metadataKey).get(data[i]);
+				if (parent!=null) {
+					dataList.add(new ParentReference().setId(parent.getId()));
+					//System.out.println("adding " + data[i]);
+				} else {
+					System.out.println("all the metadataChildren: ");
+					System.out.println(metadataChildren);
+					System.out.println("why is this null?");
+					System.out.println("we're lookin in: ");
+					System.out.println(metadataChildren.get(metadataKey));
+					System.out.println("for " + data[i]);
+					System.out.println("in " + Arrays.toString(data));
+					System.out.println("couldn't find folder for " + metadataChildren.get(metadataKey) + " : " + data[i]);
+					
+				}
+			}
+			
+			StringBuffer buffer = new StringBuffer();
+			buffer.append("X\tY\n");			
+			for (int i = dataStart+1; i < data.length; i++) {
+				buffer.append(metadataArray[i]).append("\t").append(data[i]).append("\n");				
+			}
+				
+			
+			File dataFile = new File();
+			dataFile.setTitle(data[dataStart]);
+			String mimeType = "text/plain";
+			dataFile.setMimeType(mimeType);
+			dataFile.setParents(dataList);
+			ByteArrayContent byteArrayContent = new ByteArrayContent("text/plain", buffer.toString().getBytes());
+			System.out.println("adding file " + data[dataStart]);
+			while (true) {
+				try {
+					Drive.Files.Insert insert = drive.files().insert(dataFile,
+							byteArrayContent);
+					
+					MediaHttpUploader uploader2 = insert.getMediaHttpUploader();
+					uploader2.setDirectUploadEnabled(false);
+					uploader2.setProgressListener(new FileUploadProgressListener());
+					insert.execute();
+
+					//dataFile = service.files().insert(dataFile, byteArrayContent).execute();
+					break;
+				} catch (GoogleJsonResponseException e) {
+					try {
+						Thread.sleep(1000);
+					} catch (InterruptedException e1) {
+						e1.printStackTrace();
+					}
+				}
+			}
+		}
+		System.out.println("all files added");
+
+	} 
 	
 	private static void writeDocsLabelsFromBlobStandardFormat(String fileName, String rootName, Drive service)
 			throws FileNotFoundException, LockException, IOException {
@@ -400,7 +698,7 @@ public class StructuredUploader {
 			HashMap<String,File> metadataKeyChildren = metadataChildren.get(metadataKey);
 			for (File file : metadataChildrenCallbacks.get(metadataKey).getFileList().getItems()) {
 				metadataKeyChildren.put(file.getTitle(), file);
-				System.out.println("adding " + file.getTitle());
+				//System.out.println("adding " + file.getTitle());
 			}
 		}
 		
@@ -415,7 +713,7 @@ public class StructuredUploader {
 				firstData = line.split("\t");
 				for (int i = 0; i < firstData.length; i++)
 					firstData[i] = firstData[i].trim();
-				System.out.println("first data " + Arrays.toString(firstData));
+				//System.out.println("first data " + Arrays.toString(firstData));
 			}
 			for (int i = 0; i < dataStart; i++) {
 				data[i] = data[i].trim();
@@ -433,19 +731,18 @@ public class StructuredUploader {
 					metadataValCallback.setHttpRequest(metadataValInsert);
 					metadataValCallbacks.add(metadataValCallback);
 					metadataValInsert.queue(batch,metadataValCallback);
-					HashMap<String,File> metadataKeyChildren = metadataChildren.get(metadataKey);
-					metadataKeyChildren.put(data[i], null);
-					System.out.println("adding " + metadataKey + ": " + data[i]);
+					metadataChildren.get(metadataKey).put(data[i], null);
+					//System.out.println("adding " + metadataKey + ": " + data[i]);
 				}
-				if (batch.size() > 10) {
-					System.out.println("executing batch ...");
+				if (batch.size() > MIN_BATCH_SIZE) {
+					System.out.println("executing batch...");
 					batch.execute();
 					System.out.println("done");
-					try {
+					/*try {
 						Thread.sleep(2000);
 					} catch (InterruptedException e) {
 						e.printStackTrace();
-					}
+					}*/
 				}
 			}
 		}
@@ -464,10 +761,12 @@ public class StructuredUploader {
 //						System.out.println(metadataChildren);
 //						//if (!metadataChildren.containsKey(metadataKey))
 //						//	metadataChildren.put(metadataKey, new HashMap<String,File>());
-//						HashMap<String,File> metadataKeyChildren = metadataChildren.get(metadataKey); 
+//						HashMap<String,File> metadataKeyChildren = metadataChildren.get(metadataKey);
+//						System.out.println("callback.getFile " + callback.getFile());
 //						metadataKeyChildren.put(callback.getFile().getTitle(), callback.getFile());
 //					}
 //				} else {
+//					System.out.println("callback.getFile: " + callback + " was null");
 //					callback.getHttpRequest().queue(batch, callback);
 //				}
 //			}
@@ -475,30 +774,48 @@ public class StructuredUploader {
 //		}
 		
 		// make sure all metadata values have been added
-		while (batch.size() > 0) {
-			batch.execute();
-			System.out.println(batch.size() + "files remaining");
-		}
-		// add metadata values folders to our hash
-		for (FileCallback callback : metadataValCallbacks) {
+		Random randomGenerator = new Random();
+		int n = 1;
+		do {
+			if (n<6)
+				n++;
 			try {
-				System.out.println("processing " + callback.getFile().getTitle());				
-			} catch (NullPointerException e) {
-				System.out.println(callback + " caused null pointer");
+				Thread.sleep((1 << n) * 1000 + randomGenerator.nextInt(1001));
+			} catch (InterruptedException e) {
+				e.printStackTrace();
 			}
+			if (batch.size() > 0) {
+				System.out.println(batch.size() + "files remaining");
+				batch.execute();
+			}			
+			for (FileCallback callback : metadataValCallbacks) {
+				if (callback.getFile() == null) {
+					callback.getHttpRequest().queue(batch, callback);
+				}
+			}
+		} while (batch.size() > 0);
+		
+		// add metadata values folders to our hash
+		int goodCount = 0;
+		int failCount = 0;
+		for (FileCallback callback : metadataValCallbacks) {
 			if (callback.getFile() != null) {
+				System.out.println("processing " + callback.getFile().getTitle());				
 				List<ParentReference> prList = callback.getFile().getParents();
 				for (ParentReference pr : prList) {
 					String metadataKey = id2Title.get(pr.getId());
-					//if (!metadataChildren.containsKey(metadataKey))
-					//	metadataChildren.put(metadataKey, new HashMap<String,File>());
-					HashMap<String,File> metadataKeyChildren = metadataChildren.get(metadataKey); 
-					metadataKeyChildren.put(callback.getFile().getTitle(), callback.getFile());
+					metadataChildren.get(metadataKey).put(callback.getFile().getTitle(), callback.getFile());
 				}
+				goodCount++;
 			} else {
-				callback.getHttpRequest().queue(batch, callback);
+				//callback.getHttpRequest().queue(batch, callback);
+				System.out.println("problem with callback : " + callback);
+				failCount++;
 			}
 		}
+		
+		System.out.println("goodcount " + goodCount);
+		System.out.println("failcount "+ failCount);
 		
 		// Now to the data
 		reader.close();
@@ -507,7 +824,6 @@ public class StructuredUploader {
 		reader.readLine(); // Read header which we don't need
 		while ((line = reader.readLine()) != null) {
 			String [] data = line.split("\t");
-						
 			ArrayList<ParentReference> dataList = new ArrayList<ParentReference>();
 			for (int i = 0; i < dataStart; i++) {
 				if (firstData[i].equals(""))
@@ -517,18 +833,17 @@ public class StructuredUploader {
 					data[i] = firstData[i];
 				String metadataKey = metadataArray[i];
 				File parent = metadataChildren.get(metadataKey).get(data[i]);
-//				if (parent==null) {
-//					System.out.println("all the metadataChildren: ");
-//					System.out.println(metadataChildren);
-//					System.out.println("why is this null?");
-//					System.out.println("we're lookin in: ");
-//					System.out.println(metadataChildren.get(metadataKey));
-//					System.out.println("for " + data[i]);
-//					System.out.println("in " + Arrays.toString(data));
-//				}
 				if (parent!=null) {
-					dataList.add(new ParentReference().setId(parent.getId()));					
+					dataList.add(new ParentReference().setId(parent.getId()));
+					//System.out.println("adding " + data[i]);
 				} else {
+					System.out.println("all the metadataChildren: ");
+					System.out.println(metadataChildren);
+					System.out.println("why is this null?");
+					System.out.println("we're lookin in: ");
+					System.out.println(metadataChildren.get(metadataKey));
+					System.out.println("for " + data[i]);
+					System.out.println("in " + Arrays.toString(data));
 					System.out.println("couldn't find folder for " + metadataChildren.get(metadataKey) + " : " + data[i]);
 					
 				}
@@ -539,15 +854,26 @@ public class StructuredUploader {
 			for (int i = dataStart+1; i < data.length; i++) {
 				buffer.append(metadataArray[i]).append("\t").append(data[i]).append("\n");				
 			}
+				
 			
 			File dataFile = new File();
 			dataFile.setTitle(data[dataStart]);
-			dataFile.setMimeType("text/plain");
+			String mimeType = "text/plain";
+			dataFile.setMimeType(mimeType);
 			dataFile.setParents(dataList);
 			ByteArrayContent byteArrayContent = new ByteArrayContent("text/plain", buffer.toString().getBytes());
+			System.out.println("adding file " + data[dataStart]);
 			while (true) {
 				try {
-					dataFile = service.files().insert(dataFile, byteArrayContent).execute();
+					Drive.Files.Insert insert = drive.files().insert(dataFile,
+							byteArrayContent);
+					
+					MediaHttpUploader uploader2 = insert.getMediaHttpUploader();
+					uploader2.setDirectUploadEnabled(false);
+					uploader2.setProgressListener(new FileUploadProgressListener());
+					insert.execute();
+
+					//dataFile = service.files().insert(dataFile, byteArrayContent).execute();
 					break;
 				} catch (GoogleJsonResponseException e) {
 					try {
@@ -558,6 +884,7 @@ public class StructuredUploader {
 				}
 			}
 		}
+		System.out.println("all files added");
 	}
 	
 	class FileCallback extends JsonBatchCallback<File> {
